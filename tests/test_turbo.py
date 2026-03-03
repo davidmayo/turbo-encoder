@@ -1,14 +1,20 @@
 import math
+from pathlib import Path
 
+import bitstring
 import pytest
 
 from turbo import (
+    DiscoveredTurboFrame,
     Turbo2Frame,
     Turbo3Frame,
     Turbo4Frame,
     Turbo6Frame,
     TurboDecodeError,
     TurboEncodeError,
+    find_frames_from_bits,
+    find_frames_from_bytes,
+    find_frames_from_file,
 )
 
 
@@ -146,3 +152,104 @@ def test_missing_inputs_raise_errors() -> None:
 
     with pytest.raises(TurboDecodeError):
         Turbo2Frame().decode()
+
+
+def _successes(
+    discovered: list[DiscoveredTurboFrame],
+) -> list[DiscoveredTurboFrame]:
+    return [frame for frame in discovered if frame.decode_success is True]
+
+
+def test_find_frames_from_bits_non_byte_aligned_start() -> None:
+    payload = _payload(223, 31)
+    encoded = Turbo2Frame(decoded=payload)
+    encoded.encode()
+    assert encoded.encoded is not None
+
+    data = (
+        bitstring.Bits("0b101")
+        + bitstring.Bits(bytes=encoded.encoded)
+        + bitstring.Bits("0b11")
+    )
+    discovered = list(find_frames_from_bits(data=data, denominator=2))
+
+    successful = _successes(discovered)
+    assert successful
+    assert any(
+        frame.start_bit_index == 3 and frame.parsed is not None and frame.parsed.decoded == payload
+        for frame in successful
+    )
+
+
+def test_find_frames_from_bits_yields_all_candidates_per_asm() -> None:
+    valid_payload = _payload(1115, 53)
+    valid = Turbo2Frame(decoded=valid_payload)
+    valid.encode()
+    assert valid.encoded is not None
+
+    invalid_payload = _payload(223, 99)
+    invalid = Turbo2Frame(decoded=invalid_payload)
+    invalid.encode()
+    assert invalid.encoded is not None
+    tampered_invalid = bytearray(invalid.encoded)
+    tampered_invalid[len(invalid.ASM)] ^= 0x80
+
+    data = bitstring.Bits(bytes=valid.encoded) + bitstring.Bits(bytes=bytes(tampered_invalid))
+    discovered = list(find_frames_from_bits(data=data, denominator=2))
+
+    at_start_zero = [frame for frame in discovered if frame.start_bit_index == 0]
+    assert len(at_start_zero) == 4
+    assert any(frame.decode_success is True for frame in at_start_zero)
+    assert any(frame.decode_success is False and frame.parsed is None for frame in discovered)
+
+
+def test_find_frames_from_bytes_delegates_and_decodes() -> None:
+    payload = _payload(223, 71)
+    encoded = Turbo3Frame(decoded=payload)
+    encoded.encode()
+    assert encoded.encoded is not None
+
+    bits = (
+        bitstring.Bits("0b10101")
+        + bitstring.Bits(bytes=encoded.encoded)
+        + bitstring.Bits("0b111")
+    )
+    discovered = list(find_frames_from_bytes(data=bits.tobytes(), denominator=3))
+
+    successful = _successes(discovered)
+    assert any(
+        frame.start_bit_index == 5 and frame.parsed is not None and frame.parsed.decoded == payload
+        for frame in successful
+    )
+
+
+def test_find_frames_from_file_sets_path(tmp_path: Path) -> None:
+    payload = _payload(223, 81)
+    encoded = Turbo2Frame(decoded=payload)
+    encoded.encode()
+    assert encoded.encoded is not None
+
+    bits = bitstring.Bits("0b111") + bitstring.Bits(bytes=encoded.encoded) + bitstring.Bits("0b0")
+    path = tmp_path / "stream.bin"
+    path.write_bytes(bits.tobytes())
+
+    discovered = list(find_frames_from_file(path=path, denominator=2))
+    successful = _successes(discovered)
+
+    assert any(
+        frame.path == path.resolve()
+        and frame.start_bit_index == 3
+        and frame.parsed is not None
+        and frame.parsed.decoded == payload
+        for frame in successful
+    )
+
+
+def test_find_frames_empty_when_no_asm() -> None:
+    discovered = list(find_frames_from_bits(data=bitstring.Bits("0b0" * 500), denominator=2))
+    assert discovered == []
+
+
+def test_find_frames_invalid_denominator_raises() -> None:
+    with pytest.raises(ValueError):
+        list(find_frames_from_bits(data=bitstring.Bits("0b0" * 300), denominator=5))  # type: ignore[arg-type]

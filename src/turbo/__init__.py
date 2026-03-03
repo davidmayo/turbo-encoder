@@ -1,5 +1,7 @@
 import dataclasses
-from typing import ClassVar, Literal
+from pathlib import Path
+from typing import ClassVar, Generator, Literal
+import bitstring
 
 
 class TurboError(RuntimeError):
@@ -321,5 +323,123 @@ class Turbo6Frame(TurboFrame):
     ASM = bytes.fromhex("25D5C0CE8990F6C9461BF79C DA2A3F31766F0936B9E40863")
 
 
+_FRAME_TYPE_BY_DENOMINATOR: dict[
+    int, type[Turbo2Frame | Turbo3Frame | Turbo4Frame | Turbo6Frame]
+] = {
+    2: Turbo2Frame,
+    3: Turbo3Frame,
+    4: Turbo4Frame,
+    6: Turbo6Frame,
+}
+
+
+@dataclasses.dataclass
+class DiscoveredTurboFrame:
+    """A turbo frame discovered in a bit stream"""
+
+    DENOMINATOR: Literal[2, 3, 4, 6]
+    path: Path | None = None
+    """The file that contains the raw data, if there is one."""
+    start_bit_index: int | None = None
+    """The bit index of the start of the frame (i.e., the start of the ASM) within the file, if there is one"""
+    decode_success: bool | None = None
+    """Does this frame decode properly?"""
+    parsed: TurboFrame | None = None
+    """The decoded data in a TurboFrame instance, if decodable"""
+
+
+def _get_frame_type_for_denominator(
+    denominator: int,
+) -> type[Turbo2Frame | Turbo3Frame | Turbo4Frame | Turbo6Frame]:
+    frame_type = _FRAME_TYPE_BY_DENOMINATOR.get(denominator)
+    if frame_type is None:
+        raise ValueError(
+            f"Unsupported denominator: {denominator}. Expected one of 2, 3, 4, 6."
+        )
+    return frame_type
+
+
+def _discovery_candidates_bits(
+    denominator: int, asm_bits_length: int
+) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        (
+            information_bits,
+            asm_bits_length + (information_bits + _TERMINATION_BITS) * denominator,
+        )
+        for information_bits in _VALID_INFORMATION_BITS
+    )
+
+
+def find_frames_from_bits(
+    *,
+    data: bitstring.Bits,
+    denominator: Literal[2, 3, 4, 6],
+) -> Generator[DiscoveredTurboFrame, None, None]:
+    frame_type = _get_frame_type_for_denominator(int(denominator))
+    asm_bits = bitstring.Bits(bytes=frame_type.ASM)
+    candidates = _discovery_candidates_bits(int(denominator), len(asm_bits))
+
+    for asm_start in data.findall(asm_bits, bytealigned=False):
+        for _, frame_bits_length in candidates:
+            frame_end = asm_start + frame_bits_length
+            if frame_end > len(data):
+                continue
+
+            candidate_bits = data[asm_start:frame_end]
+            candidate_frame = frame_type(encoded=candidate_bits.tobytes())
+            try:
+                candidate_frame.decode()
+                yield DiscoveredTurboFrame(
+                    DENOMINATOR=denominator,
+                    path=None,
+                    start_bit_index=asm_start,
+                    decode_success=True,
+                    parsed=candidate_frame,
+                )
+            except TurboDecodeError:
+                yield DiscoveredTurboFrame(
+                    DENOMINATOR=denominator,
+                    path=None,
+                    start_bit_index=asm_start,
+                    decode_success=False,
+                    parsed=None,
+                )
+
+
+def find_frames_from_bytes(
+    *,
+    data: bytes | bytearray | memoryview | bitstring.Bits,
+    denominator: Literal[2, 3, 4, 6],
+) -> Generator[DiscoveredTurboFrame, None, None]:
+    bits = data if isinstance(data, bitstring.Bits) else bitstring.Bits(bytes=bytes(data))
+    yield from find_frames_from_bits(data=bits, denominator=denominator)
+
+
+def find_frames_from_file(
+    *,
+    path: str | bytes | Path,
+    denominator: Literal[2, 3, 4, 6],
+) -> Generator[DiscoveredTurboFrame, None, None]:
+    resolved_path = Path(path).resolve()
+    data = bitstring.Bits(filename=str(resolved_path))
+    for discovered in find_frames_from_bits(data=data, denominator=denominator):
+        discovered.path = resolved_path
+        yield discovered
+
+
 if __name__ == "__main__":
-    pass
+    from pathlib import Path
+
+    path = Path("/home/mayo/Downloads/LMA3_Sim_Files_20250611/1kbps_t6_SimFile/LMA3001kt6250611.bin")
+    found_frames = list(find_frames_from_file(path=path, denominator=6))
+    print(f"Found {len(found_frames)}")
+    from collections import Counter
+    counter=Counter()
+    for found_frame in found_frames:
+        counter[found_frame.decode_success] += 1
+    print(counter)
+    indexes = [f.start_bit_index for f in found_frames]
+    byte_indexes = [i / 8 for i in indexes]
+    print(f"{byte_indexes[:5]}")
+    print(f"{byte_indexes[-5:]}")

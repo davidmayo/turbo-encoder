@@ -7,7 +7,9 @@ authors = [
     { name = "David Mayo", email = "dcmayo@moreheadstate.edu" }
 ]
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "bitstring>=4.3.1",
+]
 
 [project.scripts]
 turbo = "turbo:main"
