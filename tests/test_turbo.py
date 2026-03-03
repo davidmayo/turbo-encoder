@@ -219,7 +219,9 @@ def test_find_frames_from_bits_non_byte_aligned_start() -> None:
     successful = _successes(discovered)
     assert successful
     assert any(
-        frame.start_bit_index == 3 and frame.parsed is not None and frame.parsed.decoded == payload
+        frame.start_bit_index == 3
+        and frame.parsed is not None
+        and frame.parsed.decoded == payload
         for frame in successful
     )
 
@@ -237,13 +239,19 @@ def test_find_frames_from_bits_yields_one_candidate_per_asm() -> None:
     tampered_invalid = bytearray(invalid.encoded)
     tampered_invalid[len(invalid.ASM)] ^= 0x80
 
-    data = bitstring.Bits(bytes=valid.encoded) + bitstring.Bits(bytes=bytes(tampered_invalid))
-    discovered = list(find_frames_from_bits(data=data, denominator=2, codeword_size_bits=8920))
+    data = bitstring.Bits(bytes=valid.encoded) + bitstring.Bits(
+        bytes=bytes(tampered_invalid)
+    )
+    discovered = list(
+        find_frames_from_bits(data=data, denominator=2, codeword_size_bits=8920)
+    )
 
     at_start_zero = [frame for frame in discovered if frame.start_bit_index == 0]
     assert len(at_start_zero) == 1
     assert any(frame.decode_success is True for frame in at_start_zero)
-    assert any(frame.decode_success is False and frame.parsed is None for frame in discovered)
+    assert any(
+        frame.decode_success is False and frame.parsed is None for frame in discovered
+    )
 
 
 def test_find_frames_from_bytes_delegates_and_decodes() -> None:
@@ -265,7 +273,9 @@ def test_find_frames_from_bytes_delegates_and_decodes() -> None:
 
     successful = _successes(discovered)
     assert any(
-        frame.start_bit_index == 5 and frame.parsed is not None and frame.parsed.decoded == payload
+        frame.start_bit_index == 5
+        and frame.parsed is not None
+        and frame.parsed.decoded == payload
         for frame in successful
     )
 
@@ -276,11 +286,17 @@ def test_find_frames_from_file_sets_path(tmp_path: Path) -> None:
     encoded.encode(codeword_size_bits=1784)
     assert encoded.encoded is not None
 
-    bits = bitstring.Bits("0b111") + bitstring.Bits(bytes=encoded.encoded) + bitstring.Bits("0b0")
+    bits = (
+        bitstring.Bits("0b111")
+        + bitstring.Bits(bytes=encoded.encoded)
+        + bitstring.Bits("0b0")
+    )
     path = tmp_path / "stream.bin"
     path.write_bytes(bits.tobytes())
 
-    discovered = list(find_frames_from_file(path=path, denominator=2, codeword_size_bits=1784))
+    discovered = list(
+        find_frames_from_file(path=path, denominator=2, codeword_size_bits=1784)
+    )
     successful = _successes(discovered)
 
     assert any(
@@ -293,7 +309,9 @@ def test_find_frames_from_file_sets_path(tmp_path: Path) -> None:
 
 
 def test_find_frames_empty_when_no_asm() -> None:
-    discovered = list(find_frames_from_bits(data=bitstring.Bits("0b0" * 500), denominator=2))
+    discovered = list(
+        find_frames_from_bits(data=bitstring.Bits("0b0" * 500), denominator=2)
+    )
     assert discovered == []
 
 
@@ -328,6 +346,8 @@ def test_find_frames_respects_pseudorandomization_mode() -> None:
         )
     )
     assert any(
-        frame.start_bit_index == 3 and frame.parsed is not None and frame.parsed.decoded == payload
+        frame.start_bit_index == 3
+        and frame.parsed is not None
+        and frame.parsed.decoded == payload
         for frame in _successes(correct_mode)
     )

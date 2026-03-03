@@ -72,7 +72,9 @@ VALID_STATUS = "VALID"
 INVALID_DECODE_STATUS = "INVALID-DECODE-FAILURE"
 INVALID_NO_ASM_STATUS = "INVALID-NO-ASM"
 
-FRAME_TYPE_BY_DENOMINATOR: dict[Denominator, type[Turbo2Frame | Turbo3Frame | Turbo4Frame | Turbo6Frame]] = {
+FRAME_TYPE_BY_DENOMINATOR: dict[
+    Denominator, type[Turbo2Frame | Turbo3Frame | Turbo4Frame | Turbo6Frame]
+] = {
     2: Turbo2Frame,
     3: Turbo3Frame,
     4: Turbo4Frame,
@@ -150,44 +152,71 @@ def _build_segments(
     return segments
 
 
-def _build_report(
-    *,
-    path: Path,
+def do_report(
+    input_path: str | bytes | Path,
+    output_path: str | bytes | Path,
     denominator: Denominator,
     word_size: CodewordSizeBits,
     pseudorandomization: PseudorandomizationMode,
-) -> dict:
-    resolved_path = path.resolve()
-    total_bits = resolved_path.stat().st_size * 8
+) -> None:
+    resolved_input = Path(input_path).resolve()
+    resolved_output = Path(output_path).resolve()
+
+    if not resolved_input.exists():
+        raise FileNotFoundError(f"Input file not found: {resolved_input}")
+    if not resolved_input.is_file():
+        raise ValueError(f"Input path is not a regular file: {resolved_input}")
+
+    total_bits = resolved_input.stat().st_size * 8
     frame_bits = _frame_bit_length(denominator, word_size)
+    print(f"Analyzing file: {resolved_input}")
+    print(
+        "Settings: "
+        f"denominator={int(denominator)} "
+        f"word_size={int(word_size)} "
+        f"pseudorandomization={pseudorandomization}"
+    )
+    print(f"Input size: {total_bits} bits")
 
     discovered_windows: list[tuple[int, int, bool]] = []
     decode_successes = 0
     decode_failures = 0
 
-    for discovered in find_frames_from_file(
-        path=resolved_path,
-        denominator=denominator,
-        pseudorandomization=pseudorandomization,
-        codeword_size_bits=word_size,
+    print("Scanning for ASM matches and validating frame candidates...")
+    for idx, discovered in enumerate(
+        find_frames_from_file(
+            path=resolved_input,
+            denominator=denominator,
+            pseudorandomization=pseudorandomization,
+            codeword_size_bits=word_size,
+        ),
+        start=1,
     ):
         start = discovered.start_bit_index
         status = discovered.decode_success
         if start is None or status is None:
             continue
+
         discovered_windows.append((start, start + frame_bits, status))
         if status:
             decode_successes += 1
         else:
             decode_failures += 1
 
+        if idx == 1 or idx % 25 == 0:
+            print(
+                f"  matches={idx} valid={decode_successes} "
+                f"decode_fail={decode_failures} last_start_bit={start}"
+            )
+
+    print("Building contiguous status segments...")
     segments = _build_segments(
         total_bits=total_bits,
         discovered_windows=discovered_windows,
     )
 
-    return {
-        "path": str(resolved_path),
+    report = {
+        "path": str(resolved_input),
         "denominator": int(denominator),
         "word_size": int(word_size),
         "pseudorandomization": pseudorandomization,
@@ -200,6 +229,17 @@ def _build_report(
             "decode_failures": decode_failures,
         },
     }
+
+    resolved_output.parent.mkdir(parents=True, exist_ok=True)
+    resolved_output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    print(
+        "Wrote report to "
+        f"{resolved_output} "
+        f"({report['summary']['total_matches']} matches, "
+        f"{report['summary']['decode_successes']} valid, "
+        f"{report['summary']['decode_failures']} decode-fail, "
+        f"{len(segments)} segments)"
+    )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -244,33 +284,12 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    input_path: Path = args.input
-    output_path: Path = args.output
-
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
-    if not input_path.is_file():
-        raise ValueError(f"Input path is not a regular file: {input_path}")
-
-    denominator: Denominator = args.denominator
-    word_size: CodewordSizeBits = args.word_size
-    pseudorandomization: PseudorandomizationMode = args.pseudorandomization
-
-    report = _build_report(
-        path=input_path,
-        denominator=denominator,
-        word_size=word_size,
-        pseudorandomization=pseudorandomization,
-    )
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(
-        "Wrote report to "
-        f"{output_path.resolve()} "
-        f"({report['summary']['total_matches']} matches, "
-        f"{report['summary']['decode_successes']} valid, "
-        f"{report['summary']['decode_failures']} decode-fail)"
+    do_report(
+        input_path=args.input,
+        output_path=args.output,
+        denominator=args.denominator,
+        word_size=args.word_size,
+        pseudorandomization=args.pseudorandomization,
     )
 
 

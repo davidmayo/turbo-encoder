@@ -605,7 +605,9 @@ if __name__ == "__main__":
         )
     ):
         if index % 100 == 0:
-            print(f"#{index+1} index: {found_frame.start_bit_index:,} GOOD: {found_frame.decode_success}")
+            print(
+                f"#{index + 1} index: {found_frame.start_bit_index:,} GOOD: {found_frame.decode_success}"
+            )
         count += 1
         counter[found_frame.decode_success] += 1
         indexes.append((found_frame.decode_success, found_frame.start_bit_index))
