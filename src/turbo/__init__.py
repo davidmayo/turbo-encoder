@@ -32,6 +32,7 @@ _G2 = (1, 0, 1, 0, 1)
 _G3 = (1, 1, 1, 1, 1)
 
 _INTERLEAVER_CACHE: dict[int, tuple[int, ...]] = {}
+_PSEUDO_RANDOMIZER_CACHE: dict[tuple[str, int], tuple[int, ...]] = {}
 
 
 def _bytes_to_bits(data: bytes) -> list[int]:
@@ -64,6 +65,40 @@ def _truncate_bits_with_padding_check(data: bytes, bit_length: int) -> list[int]
 
 def _packed_codeword_bytes(information_bits: int, denominator: int) -> int:
     return ((information_bits + _TERMINATION_BITS) * denominator + 7) // 8
+
+
+def _pseudo_randomizer_bits(kind: Literal["legacy_255", "modern_131071"], length: int) -> tuple[int, ...]:
+    cached = _PSEUDO_RANDOMIZER_CACHE.get((kind, length))
+    if cached is not None:
+        return cached
+
+    if kind == "legacy_255":
+        state = [1] * 8
+        sequence = [0] * length
+        for idx in range(length):
+            sequence[idx] = state[-1]  # x0
+            feedback = state[0] ^ state[2] ^ state[4] ^ state[-1]  # x7 ^ x5 ^ x3 ^ x0
+            state = [feedback] + state[:-1]
+    elif kind == "modern_131071":
+        state = [int(bit) for bit in "11000111000111000"]
+        sequence = [0] * length
+        for idx in range(length):
+            sequence[idx] = state[-1]  # x0
+            feedback = state[2] ^ state[-1]  # x14 ^ x0
+            state = [feedback] + state[:-1]
+    else:
+        raise ValueError(f"Unsupported pseudo-randomizer kind: {kind}")
+
+    result = tuple(sequence)
+    _PSEUDO_RANDOMIZER_CACHE[(kind, length)] = result
+    return result
+
+
+def _derandomize_codeword_bits(
+    codeword_bits: list[int], *, kind: Literal["legacy_255", "modern_131071"]
+) -> list[int]:
+    prn = _pseudo_randomizer_bits(kind, len(codeword_bits))
+    return [bit ^ prn_bit for bit, prn_bit in zip(codeword_bits, prn)]
 
 
 def _interleaver_indices(information_bits: int) -> tuple[int, ...]:
@@ -274,29 +309,42 @@ class TurboFrame:
         codeword_bits = _truncate_bits_with_padding_check(
             codeword_bytes, total_codeword_bits
         )
-
-        if self.DENOMINATOR == 2:
-            systematic = codeword_bits[::2]
-        else:
-            systematic = codeword_bits[:: self.DENOMINATOR]
-
         expected_systematic_length = information_bits_count + _TERMINATION_BITS
-        if len(systematic) != expected_systematic_length:
-            raise TurboDecodeError(
-                "Invalid systematic stream length extracted from codeword. "
-                f"Expected {expected_systematic_length}, got {len(systematic)}."
-            )
 
-        candidate_information_bits = systematic[:information_bits_count]
-        expected_codeword_bits = _build_codeword_bits(
-            candidate_information_bits, self.DENOMINATOR
-        )
-        if expected_codeword_bits != codeword_bits:
+        def _decode_candidate(candidate_bits: list[int]) -> bytes | None:
+            if self.DENOMINATOR == 2:
+                systematic = candidate_bits[::2]
+            else:
+                systematic = candidate_bits[:: self.DENOMINATOR]
+
+            if len(systematic) != expected_systematic_length:
+                return None
+
+            candidate_information_bits = systematic[:information_bits_count]
+            expected_codeword_bits = _build_codeword_bits(
+                candidate_information_bits, self.DENOMINATOR
+            )
+            if expected_codeword_bits != candidate_bits:
+                return None
+            return _bits_to_bytes(candidate_information_bits)
+
+        decoded = _decode_candidate(codeword_bits)
+        if decoded is None:
+            for randomizer in ("legacy_255", "modern_131071"):
+                derandomized = _derandomize_codeword_bits(
+                    codeword_bits,
+                    kind=randomizer,
+                )
+                decoded = _decode_candidate(derandomized)
+                if decoded is not None:
+                    break
+
+        if decoded is None:
             raise TurboDecodeError(
                 "Codeword parity/termination validation failed; frame cannot be decoded"
             )
 
-        self.decoded = _bits_to_bytes(candidate_information_bits)
+        self.decoded = decoded
 
 
 @dataclasses.dataclass

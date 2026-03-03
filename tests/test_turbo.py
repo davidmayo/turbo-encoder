@@ -160,6 +160,51 @@ def _successes(
     return [frame for frame in discovered if frame.decode_success is True]
 
 
+def _legacy_randomize_encoded(encoded: bytes, asm: bytes, codeword_bits_len: int) -> bytes:
+    bits = bitstring.Bits(bytes=encoded)
+    asm_bits_len = len(asm) * 8
+
+    codeword = [1 if bit == "1" else 0 for bit in bits[asm_bits_len : asm_bits_len + codeword_bits_len].bin]
+    state = [1] * 8
+    randomized = [0] * len(codeword)
+    for idx, bit in enumerate(codeword):
+        pseudo_random = state[-1]
+        feedback = state[0] ^ state[2] ^ state[4] ^ state[-1]
+        state = [feedback] + state[:-1]
+        randomized[idx] = bit ^ pseudo_random
+
+    randomized_bits = bitstring.Bits(
+        bin="".join("1" if bit else "0" for bit in randomized)
+    )
+    return (
+        bits[:asm_bits_len]
+        + randomized_bits
+        + bits[asm_bits_len + codeword_bits_len :]
+    ).tobytes()
+
+
+@pytest.mark.parametrize(
+    ("frame_cls", "payload_size"),
+    ((Turbo2Frame, 223), (Turbo3Frame, 223), (Turbo6Frame, 1115)),
+)
+def test_decode_accepts_legacy_randomized_codeword(
+    frame_cls: type[Turbo2Frame | Turbo3Frame | Turbo6Frame],
+    payload_size: int,
+) -> None:
+    payload = _payload(payload_size, payload_size + 123)
+    encoded = frame_cls(decoded=payload)
+    encoded.encode()
+    assert encoded.encoded is not None
+
+    codeword_bits_len = (len(payload) * 8 + 4) * frame_cls.DENOMINATOR
+    randomized = _legacy_randomize_encoded(
+        encoded.encoded, encoded.ASM, codeword_bits_len
+    )
+    decoded = frame_cls(encoded=randomized)
+    decoded.decode()
+    assert decoded.decoded == payload
+
+
 def test_find_frames_from_bits_non_byte_aligned_start() -> None:
     payload = _payload(223, 31)
     encoded = Turbo2Frame(decoded=payload)
