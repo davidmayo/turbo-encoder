@@ -160,49 +160,37 @@ def _successes(
     return [frame for frame in discovered if frame.decode_success is True]
 
 
-def _legacy_randomize_encoded(encoded: bytes, asm: bytes, codeword_bits_len: int) -> bytes:
-    bits = bitstring.Bits(bytes=encoded)
-    asm_bits_len = len(asm) * 8
-
-    codeword = [1 if bit == "1" else 0 for bit in bits[asm_bits_len : asm_bits_len + codeword_bits_len].bin]
-    state = [1] * 8
-    randomized = [0] * len(codeword)
-    for idx, bit in enumerate(codeword):
-        pseudo_random = state[-1]
-        feedback = state[0] ^ state[2] ^ state[4] ^ state[-1]
-        state = [feedback] + state[:-1]
-        randomized[idx] = bit ^ pseudo_random
-
-    randomized_bits = bitstring.Bits(
-        bin="".join("1" if bit else "0" for bit in randomized)
-    )
-    return (
-        bits[:asm_bits_len]
-        + randomized_bits
-        + bits[asm_bits_len + codeword_bits_len :]
-    ).tobytes()
-
-
 @pytest.mark.parametrize(
-    ("frame_cls", "payload_size"),
-    ((Turbo2Frame, 223), (Turbo3Frame, 223), (Turbo6Frame, 1115)),
+    ("frame_cls", "payload_size", "mode"),
+    (
+        (Turbo2Frame, 223, "none"),
+        (Turbo3Frame, 223, "legacy"),
+        (Turbo6Frame, 1115, "modern"),
+    ),
 )
-def test_decode_accepts_legacy_randomized_codeword(
+def test_encode_decode_accepts_explicit_pseudorandomization_modes(
     frame_cls: type[Turbo2Frame | Turbo3Frame | Turbo6Frame],
     payload_size: int,
+    mode: str,
 ) -> None:
     payload = _payload(payload_size, payload_size + 123)
     encoded = frame_cls(decoded=payload)
-    encoded.encode()
+    encoded.encode(pseudorandomization=mode)  # type: ignore[arg-type]
     assert encoded.encoded is not None
 
-    codeword_bits_len = (len(payload) * 8 + 4) * frame_cls.DENOMINATOR
-    randomized = _legacy_randomize_encoded(
-        encoded.encoded, encoded.ASM, codeword_bits_len
-    )
-    decoded = frame_cls(encoded=randomized)
-    decoded.decode()
+    decoded = frame_cls(encoded=encoded.encoded)
+    decoded.decode(pseudorandomization=mode)  # type: ignore[arg-type]
     assert decoded.decoded == payload
+
+
+def test_decode_fails_when_pseudorandomization_mode_mismatch() -> None:
+    payload = _payload(223, 141)
+    encoded = Turbo2Frame(decoded=payload)
+    encoded.encode(pseudorandomization="legacy")
+    assert encoded.encoded is not None
+
+    with pytest.raises(TurboDecodeError):
+        Turbo2Frame(encoded=encoded.encoded).decode(pseudorandomization="none")
 
 
 def test_find_frames_from_bits_non_byte_aligned_start() -> None:
@@ -298,3 +286,24 @@ def test_find_frames_empty_when_no_asm() -> None:
 def test_find_frames_invalid_denominator_raises() -> None:
     with pytest.raises(ValueError):
         list(find_frames_from_bits(data=bitstring.Bits("0b0" * 300), denominator=5))  # type: ignore[arg-type]
+
+
+def test_find_frames_respects_pseudorandomization_mode() -> None:
+    payload = _payload(223, 155)
+    encoded = Turbo2Frame(decoded=payload)
+    encoded.encode(pseudorandomization="modern")
+    assert encoded.encoded is not None
+
+    data = bitstring.Bits("0b101") + bitstring.Bits(bytes=encoded.encoded)
+    wrong_mode = list(
+        find_frames_from_bits(data=data, denominator=2, pseudorandomization="legacy")
+    )
+    assert not _successes(wrong_mode)
+
+    correct_mode = list(
+        find_frames_from_bits(data=data, denominator=2, pseudorandomization="modern")
+    )
+    assert any(
+        frame.start_bit_index == 3 and frame.parsed is not None and frame.parsed.decoded == payload
+        for frame in _successes(correct_mode)
+    )

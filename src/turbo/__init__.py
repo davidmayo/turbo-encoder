@@ -3,6 +3,8 @@ from pathlib import Path
 from typing import ClassVar, Generator, Literal
 import bitstring
 
+PseudorandomizationMode = Literal["none", "legacy", "modern"]
+
 
 class TurboError(RuntimeError):
     """An error with a Turbo encoding/decoding process"""
@@ -32,7 +34,9 @@ _G2 = (1, 0, 1, 0, 1)
 _G3 = (1, 1, 1, 1, 1)
 
 _INTERLEAVER_CACHE: dict[int, tuple[int, ...]] = {}
-_PSEUDO_RANDOMIZER_CACHE: dict[tuple[str, int], tuple[int, ...]] = {}
+_PSEUDO_RANDOMIZER_CACHE: dict[
+    tuple[PseudorandomizationMode, int], tuple[int, ...]
+] = {}
 
 
 def _bytes_to_bits(data: bytes) -> list[int]:
@@ -67,19 +71,24 @@ def _packed_codeword_bytes(information_bits: int, denominator: int) -> int:
     return ((information_bits + _TERMINATION_BITS) * denominator + 7) // 8
 
 
-def _pseudo_randomizer_bits(kind: Literal["legacy_255", "modern_131071"], length: int) -> tuple[int, ...]:
-    cached = _PSEUDO_RANDOMIZER_CACHE.get((kind, length))
+def _pseudo_randomizer_bits(
+    pseudorandomization: PseudorandomizationMode, length: int
+) -> tuple[int, ...]:
+    if pseudorandomization == "none":
+        return (0,) * length
+
+    cached = _PSEUDO_RANDOMIZER_CACHE.get((pseudorandomization, length))
     if cached is not None:
         return cached
 
-    if kind == "legacy_255":
+    if pseudorandomization == "legacy":
         state = [1] * 8
         sequence = [0] * length
         for idx in range(length):
             sequence[idx] = state[-1]  # x0
             feedback = state[0] ^ state[2] ^ state[4] ^ state[-1]  # x7 ^ x5 ^ x3 ^ x0
             state = [feedback] + state[:-1]
-    elif kind == "modern_131071":
+    elif pseudorandomization == "modern":
         state = [int(bit) for bit in "11000111000111000"]
         sequence = [0] * length
         for idx in range(length):
@@ -87,17 +96,22 @@ def _pseudo_randomizer_bits(kind: Literal["legacy_255", "modern_131071"], length
             feedback = state[2] ^ state[-1]  # x14 ^ x0
             state = [feedback] + state[:-1]
     else:
-        raise ValueError(f"Unsupported pseudo-randomizer kind: {kind}")
+        raise ValueError(
+            f"Unsupported pseudorandomization mode: {pseudorandomization}. "
+            "Expected one of 'none', 'legacy', 'modern'."
+        )
 
     result = tuple(sequence)
-    _PSEUDO_RANDOMIZER_CACHE[(kind, length)] = result
+    _PSEUDO_RANDOMIZER_CACHE[(pseudorandomization, length)] = result
     return result
 
 
-def _derandomize_codeword_bits(
-    codeword_bits: list[int], *, kind: Literal["legacy_255", "modern_131071"]
+def _apply_pseudorandomization(
+    codeword_bits: list[int], *, pseudorandomization: PseudorandomizationMode
 ) -> list[int]:
-    prn = _pseudo_randomizer_bits(kind, len(codeword_bits))
+    if pseudorandomization == "none":
+        return list(codeword_bits)
+    prn = _pseudo_randomizer_bits(pseudorandomization, len(codeword_bits))
     return [bit ^ prn_bit for bit, prn_bit in zip(codeword_bits, prn)]
 
 
@@ -238,7 +252,9 @@ class TurboFrame:
     encoded: bytes | None = None
     decoded: bytes | None = None
 
-    def encode(self) -> None:
+    def encode(
+        self, *, pseudorandomization: PseudorandomizationMode = "legacy"
+    ) -> None:
         """Encode the `decoded` value according to the specific turbo encoding algorithm
 
         Resulting value will be stored in `encoded`.
@@ -256,9 +272,14 @@ class TurboFrame:
 
         information_bits = _bytes_to_bits(self.decoded)
         codeword_bits = _build_codeword_bits(information_bits, self.DENOMINATOR)
+        codeword_bits = _apply_pseudorandomization(
+            codeword_bits, pseudorandomization=pseudorandomization
+        )
         self.encoded = self.ASM + _bits_to_bytes(codeword_bits)
 
-    def decode(self) -> None:
+    def decode(
+        self, *, pseudorandomization: PseudorandomizationMode = "legacy"
+    ) -> None:
         """Decode the `encoded` value according to the specific turbo decoding algorithm.
 
         Resulting value will be stored in `decoded`.
@@ -328,16 +349,10 @@ class TurboFrame:
                 return None
             return _bits_to_bytes(candidate_information_bits)
 
-        decoded = _decode_candidate(codeword_bits)
-        if decoded is None:
-            for randomizer in ("legacy_255", "modern_131071"):
-                derandomized = _derandomize_codeword_bits(
-                    codeword_bits,
-                    kind=randomizer,
-                )
-                decoded = _decode_candidate(derandomized)
-                if decoded is not None:
-                    break
+        candidate_bits = _apply_pseudorandomization(
+            codeword_bits, pseudorandomization=pseudorandomization
+        )
+        decoded = _decode_candidate(candidate_bits)
 
         if decoded is None:
             raise TurboDecodeError(
@@ -423,6 +438,7 @@ def find_frames_from_bits(
     *,
     data: bitstring.Bits,
     denominator: Literal[2, 3, 4, 6],
+    pseudorandomization: PseudorandomizationMode = "legacy",
 ) -> Generator[DiscoveredTurboFrame, None, None]:
     frame_type = _get_frame_type_for_denominator(int(denominator))
     asm_bits = bitstring.Bits(bytes=frame_type.ASM)
@@ -437,7 +453,7 @@ def find_frames_from_bits(
             candidate_bits = data[asm_start:frame_end]
             candidate_frame = frame_type(encoded=candidate_bits.tobytes())
             try:
-                candidate_frame.decode()
+                candidate_frame.decode(pseudorandomization=pseudorandomization)
                 yield DiscoveredTurboFrame(
                     DENOMINATOR=denominator,
                     path=None,
@@ -459,19 +475,31 @@ def find_frames_from_bytes(
     *,
     data: bytes | bytearray | memoryview | bitstring.Bits,
     denominator: Literal[2, 3, 4, 6],
+    pseudorandomization: PseudorandomizationMode = "legacy",
 ) -> Generator[DiscoveredTurboFrame, None, None]:
-    bits = data if isinstance(data, bitstring.Bits) else bitstring.Bits(bytes=bytes(data))
-    yield from find_frames_from_bits(data=bits, denominator=denominator)
+    bits = (
+        data if isinstance(data, bitstring.Bits) else bitstring.Bits(bytes=bytes(data))
+    )
+    yield from find_frames_from_bits(
+        data=bits,
+        denominator=denominator,
+        pseudorandomization=pseudorandomization,
+    )
 
 
 def find_frames_from_file(
     *,
     path: str | bytes | Path,
     denominator: Literal[2, 3, 4, 6],
+    pseudorandomization: PseudorandomizationMode = "legacy",
 ) -> Generator[DiscoveredTurboFrame, None, None]:
     resolved_path = Path(path).resolve()
     data = bitstring.Bits(filename=str(resolved_path))
-    for discovered in find_frames_from_bits(data=data, denominator=denominator):
+    for discovered in find_frames_from_bits(
+        data=data,
+        denominator=denominator,
+        pseudorandomization=pseudorandomization,
+    ):
         discovered.path = resolved_path
         yield discovered
 
@@ -479,15 +507,17 @@ def find_frames_from_file(
 if __name__ == "__main__":
     from pathlib import Path
 
-    path = Path("/home/mayo/Downloads/LMA3_Sim_Files_20250611/1kbps_t6_SimFile/LMA3001kt6250611.bin")
+    path = Path(
+        "/home/mayo/Downloads/LMA3_Sim_Files_20250611/1kbps_t6_SimFile/LMA3001kt6250611.bin"
+    )
     found_frames = list(find_frames_from_file(path=path, denominator=6))
     print(f"Found {len(found_frames)}")
     from collections import Counter
-    counter=Counter()
+
+    counter = Counter()
     for found_frame in found_frames:
         counter[found_frame.decode_success] += 1
     print(counter)
     indexes = [f.start_bit_index for f in found_frames]
-    byte_indexes = [i / 8 for i in indexes]
-    print(f"{byte_indexes[:5]}")
-    print(f"{byte_indexes[-5:]}")
+    print(f"{indexes[:25]}")
+    print(f"{indexes[-25:]}")
