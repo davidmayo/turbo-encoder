@@ -38,6 +38,9 @@ _INTERLEAVER_CACHE: dict[int, tuple[int, ...]] = {}
 _PSEUDO_RANDOMIZER_CACHE: dict[
     tuple[PseudorandomizationMode, int], tuple[int, ...]
 ] = {}
+_BYTE_TO_BITS = tuple(
+    tuple((byte >> shift) & 1 for shift in range(7, -1, -1)) for byte in range(256)
+)
 
 
 def _bytes_to_bits(data: bytes) -> list[int]:
@@ -123,6 +126,22 @@ def _apply_pseudorandomization(
         return list(codeword_bits)
     prn = _pseudo_randomizer_bits(pseudorandomization, len(codeword_bits))
     return [bit ^ prn_bit for bit, prn_bit in zip(codeword_bits, prn)]
+
+
+def _read_bit_slice_from_file(
+    *,
+    handle,
+    start_bit_index: int,
+    bit_length: int,
+) -> bitstring.Bits:
+    start_byte_index = start_bit_index // 8
+    start_bit_offset = start_bit_index % 8
+    bytes_to_read = (start_bit_offset + bit_length + 7) // 8
+    handle.seek(start_byte_index)
+    raw = handle.read(bytes_to_read)
+    if len(raw) != bytes_to_read:
+        raise EOFError("Requested bit slice extends beyond the available file data")
+    return bitstring.Bits(bytes=raw, offset=start_bit_offset, length=bit_length)
 
 
 def _interleaver_indices(information_bits: int) -> tuple[int, ...]:
@@ -499,35 +518,103 @@ def find_frames_from_file(
     codeword_size_bits: CodewordSizeBits = 8920,
 ) -> Generator[DiscoveredTurboFrame, None, None]:
     resolved_path = Path(path).resolve()
-    data = bitstring.Bits(filename=str(resolved_path))
-    for discovered in find_frames_from_bits(
-        data=data,
-        denominator=denominator,
-        pseudorandomization=pseudorandomization,
-        codeword_size_bits=codeword_size_bits,
+    frame_type = _get_frame_type_for_denominator(int(denominator))
+    information_bits_count = _validate_codeword_size_bits(codeword_size_bits)
+    asm_bits = bitstring.Bits(bytes=frame_type.ASM)
+    asm_length = len(asm_bits)
+    asm_mask = (1 << asm_length) - 1
+    asm_value = asm_bits.uint
+
+    frame_bits_length = asm_length + (information_bits_count + _TERMINATION_BITS) * int(
+        denominator
+    )
+    total_bits = resolved_path.stat().st_size * 8
+
+    bits_seen = 0
+    rolling = 0
+    chunk_size = 1024 * 1024
+
+    with (
+        resolved_path.open("rb") as scan_handle,
+        resolved_path.open("rb") as read_handle,
     ):
-        discovered.path = resolved_path
-        yield discovered
+        while True:
+            chunk = scan_handle.read(chunk_size)
+            if not chunk:
+                break
+
+            for byte in chunk:
+                for bit in _BYTE_TO_BITS[byte]:
+                    rolling = ((rolling << 1) | bit) & asm_mask
+                    if bits_seen >= asm_length - 1 and rolling == asm_value:
+                        start_bit_index = bits_seen - asm_length + 1
+                        if start_bit_index + frame_bits_length > total_bits:
+                            bits_seen += 1
+                            continue
+
+                        candidate_bits = _read_bit_slice_from_file(
+                            handle=read_handle,
+                            start_bit_index=start_bit_index,
+                            bit_length=frame_bits_length,
+                        )
+                        candidate_frame = frame_type(encoded=candidate_bits.tobytes())
+                        try:
+                            candidate_frame.decode(
+                                pseudorandomization=pseudorandomization,
+                                codeword_size_bits=codeword_size_bits,
+                            )
+                            yield DiscoveredTurboFrame(
+                                DENOMINATOR=denominator,
+                                path=resolved_path,
+                                start_bit_index=start_bit_index,
+                                decode_success=True,
+                                parsed=candidate_frame,
+                            )
+                        except TurboDecodeError:
+                            yield DiscoveredTurboFrame(
+                                DENOMINATOR=denominator,
+                                path=resolved_path,
+                                start_bit_index=start_bit_index,
+                                decode_success=False,
+                                parsed=None,
+                            )
+
+                    bits_seen += 1
 
 
 if __name__ == "__main__":
     from pathlib import Path
+    from collections import Counter
 
+    indexes: list[tuple[bool, int]] = []
+    counter = Counter()
     path = Path(
-        "/home/mayo/Downloads/LMA3_Sim_Files_20250611/1kbps_t6_SimFile/LMA3001kt6250611.bin"
+        # "/home/mayo/Downloads/LMA3_Sim_Files_20250611/1kbps_t6_SimFile/LMA3001kt6250611.bin"
+        "/home/mayo/Downloads/LMA3_Sim_Files_20250611/16kbps_t6_SimFile/LMA3016kt6250211.bin"
     )
 
     import time
-    start = time.monotonic()
-    found_frames = list(find_frames_from_file(path=path, denominator=6, codeword_size_bits=8920))
-    end = time.monotonic()
-    print(f"Found {len(found_frames)} in {(end-start)} s")
-    from collections import Counter
 
-    counter = Counter()
-    for found_frame in found_frames:
+    start = time.monotonic()
+    count = 0
+    for index, found_frame in enumerate(
+        find_frames_from_file(
+            path=path,
+            denominator=6,
+            codeword_size_bits=8920,
+        )
+    ):
+        if index % 100 == 0:
+            print(f"#{index+1} index: {found_frame.start_bit_index:,} GOOD: {found_frame.decode_success}")
+        count += 1
         counter[found_frame.decode_success] += 1
+        indexes.append((found_frame.decode_success, found_frame.start_bit_index))
+    end = time.monotonic()
+    print(f"Found {count} in {(end - start)} s")
+
+    # for found_frame in found_frames:
+    #     counter[found_frame.decode_success] += 1
     print(counter)
-    indexes = [f.start_bit_index for f in found_frames]
+    # indexes = [f.start_bit_index for f in found_frames]
     print(f"{indexes[:25]}")
     print(f"{indexes[-25:]}")
