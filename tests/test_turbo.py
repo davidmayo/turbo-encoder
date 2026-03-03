@@ -47,7 +47,7 @@ def test_encode_success_matrix(
     payload = _payload(payload_size, denominator + payload_size)
     frame = frame_cls(decoded=payload)
 
-    frame.encode()
+    frame.encode(codeword_size_bits=payload_size * 8)  # type: ignore[arg-type]
 
     assert frame.encoded is not None
     assert frame.encoded.startswith(frame.ASM)
@@ -74,11 +74,11 @@ def test_decode_roundtrip_matrix(
     payload = _payload(payload_size, denominator + payload_size + 99)
 
     encoded_frame = frame_cls(decoded=payload)
-    encoded_frame.encode()
+    encoded_frame.encode(codeword_size_bits=payload_size * 8)  # type: ignore[arg-type]
     assert encoded_frame.encoded is not None
 
     decoded_frame = frame_cls(encoded=encoded_frame.encoded)
-    decoded_frame.decode()
+    decoded_frame.decode(codeword_size_bits=payload_size * 8)  # type: ignore[arg-type]
     assert decoded_frame.decoded == payload
 
 
@@ -97,26 +97,26 @@ def test_decode_accepts_raw_codeword_without_asm(
     payload = _payload(payload_size, payload_size + 7)
 
     encoded_frame = frame_cls(decoded=payload)
-    encoded_frame.encode()
+    encoded_frame.encode(codeword_size_bits=payload_size * 8)  # type: ignore[arg-type]
     assert encoded_frame.encoded is not None
 
     raw_codeword = encoded_frame.encoded[len(encoded_frame.ASM) :]
     decoded_frame = frame_cls(encoded=raw_codeword)
-    decoded_frame.decode()
+    decoded_frame.decode(codeword_size_bits=payload_size * 8)  # type: ignore[arg-type]
     assert decoded_frame.decoded == payload
 
 
 def test_decode_rejects_corrupted_codeword() -> None:
     payload = _payload(223, 123)
     frame = Turbo4Frame(decoded=payload)
-    frame.encode()
+    frame.encode(codeword_size_bits=1784)
     assert frame.encoded is not None
 
     tampered = bytearray(frame.encoded)
     tampered[len(frame.ASM)] ^= 0x80
 
     with pytest.raises(TurboDecodeError):
-        Turbo4Frame(encoded=bytes(tampered)).decode()
+        Turbo4Frame(encoded=bytes(tampered)).decode(codeword_size_bits=1784)
 
 
 def test_invalid_payload_size_raises_encode_error() -> None:
@@ -132,7 +132,7 @@ def test_invalid_encoded_size_raises_decode_error() -> None:
 def test_rate_1_3_padding_bits_zero_and_rejected_if_nonzero() -> None:
     payload = _payload(223, 44)
     frame = Turbo3Frame(decoded=payload)
-    frame.encode()
+    frame.encode(codeword_size_bits=1784)
     assert frame.encoded is not None
 
     raw_codeword = frame.encoded[len(frame.ASM) :]
@@ -143,7 +143,7 @@ def test_rate_1_3_padding_bits_zero_and_rejected_if_nonzero() -> None:
     tampered_encoded = frame.ASM + bytes(tampered_raw)
 
     with pytest.raises(TurboDecodeError):
-        Turbo3Frame(encoded=tampered_encoded).decode()
+        Turbo3Frame(encoded=tampered_encoded).decode(codeword_size_bits=1784)
 
 
 def test_missing_inputs_raise_errors() -> None:
@@ -175,28 +175,36 @@ def test_encode_decode_accepts_explicit_pseudorandomization_modes(
 ) -> None:
     payload = _payload(payload_size, payload_size + 123)
     encoded = frame_cls(decoded=payload)
-    encoded.encode(pseudorandomization=mode)  # type: ignore[arg-type]
+    encoded.encode(
+        pseudorandomization=mode,
+        codeword_size_bits=payload_size * 8,  # type: ignore[arg-type]
+    )
     assert encoded.encoded is not None
 
     decoded = frame_cls(encoded=encoded.encoded)
-    decoded.decode(pseudorandomization=mode)  # type: ignore[arg-type]
+    decoded.decode(
+        pseudorandomization=mode,
+        codeword_size_bits=payload_size * 8,  # type: ignore[arg-type]
+    )
     assert decoded.decoded == payload
 
 
 def test_decode_fails_when_pseudorandomization_mode_mismatch() -> None:
     payload = _payload(223, 141)
     encoded = Turbo2Frame(decoded=payload)
-    encoded.encode(pseudorandomization="legacy")
+    encoded.encode(pseudorandomization="legacy", codeword_size_bits=1784)
     assert encoded.encoded is not None
 
     with pytest.raises(TurboDecodeError):
-        Turbo2Frame(encoded=encoded.encoded).decode(pseudorandomization="none")
+        Turbo2Frame(encoded=encoded.encoded).decode(
+            pseudorandomization="none", codeword_size_bits=1784
+        )
 
 
 def test_find_frames_from_bits_non_byte_aligned_start() -> None:
     payload = _payload(223, 31)
     encoded = Turbo2Frame(decoded=payload)
-    encoded.encode()
+    encoded.encode(codeword_size_bits=1784)
     assert encoded.encoded is not None
 
     data = (
@@ -204,7 +212,9 @@ def test_find_frames_from_bits_non_byte_aligned_start() -> None:
         + bitstring.Bits(bytes=encoded.encoded)
         + bitstring.Bits("0b11")
     )
-    discovered = list(find_frames_from_bits(data=data, denominator=2))
+    discovered = list(
+        find_frames_from_bits(data=data, denominator=2, codeword_size_bits=1784)
+    )
 
     successful = _successes(discovered)
     assert successful
@@ -214,13 +224,13 @@ def test_find_frames_from_bits_non_byte_aligned_start() -> None:
     )
 
 
-def test_find_frames_from_bits_yields_all_candidates_per_asm() -> None:
+def test_find_frames_from_bits_yields_one_candidate_per_asm() -> None:
     valid_payload = _payload(1115, 53)
     valid = Turbo2Frame(decoded=valid_payload)
     valid.encode()
     assert valid.encoded is not None
 
-    invalid_payload = _payload(223, 99)
+    invalid_payload = _payload(1115, 99)
     invalid = Turbo2Frame(decoded=invalid_payload)
     invalid.encode()
     assert invalid.encoded is not None
@@ -228,10 +238,10 @@ def test_find_frames_from_bits_yields_all_candidates_per_asm() -> None:
     tampered_invalid[len(invalid.ASM)] ^= 0x80
 
     data = bitstring.Bits(bytes=valid.encoded) + bitstring.Bits(bytes=bytes(tampered_invalid))
-    discovered = list(find_frames_from_bits(data=data, denominator=2))
+    discovered = list(find_frames_from_bits(data=data, denominator=2, codeword_size_bits=8920))
 
     at_start_zero = [frame for frame in discovered if frame.start_bit_index == 0]
-    assert len(at_start_zero) == 4
+    assert len(at_start_zero) == 1
     assert any(frame.decode_success is True for frame in at_start_zero)
     assert any(frame.decode_success is False and frame.parsed is None for frame in discovered)
 
@@ -239,7 +249,7 @@ def test_find_frames_from_bits_yields_all_candidates_per_asm() -> None:
 def test_find_frames_from_bytes_delegates_and_decodes() -> None:
     payload = _payload(223, 71)
     encoded = Turbo3Frame(decoded=payload)
-    encoded.encode()
+    encoded.encode(codeword_size_bits=1784)
     assert encoded.encoded is not None
 
     bits = (
@@ -247,7 +257,11 @@ def test_find_frames_from_bytes_delegates_and_decodes() -> None:
         + bitstring.Bits(bytes=encoded.encoded)
         + bitstring.Bits("0b111")
     )
-    discovered = list(find_frames_from_bytes(data=bits.tobytes(), denominator=3))
+    discovered = list(
+        find_frames_from_bytes(
+            data=bits.tobytes(), denominator=3, codeword_size_bits=1784
+        )
+    )
 
     successful = _successes(discovered)
     assert any(
@@ -259,14 +273,14 @@ def test_find_frames_from_bytes_delegates_and_decodes() -> None:
 def test_find_frames_from_file_sets_path(tmp_path: Path) -> None:
     payload = _payload(223, 81)
     encoded = Turbo2Frame(decoded=payload)
-    encoded.encode()
+    encoded.encode(codeword_size_bits=1784)
     assert encoded.encoded is not None
 
     bits = bitstring.Bits("0b111") + bitstring.Bits(bytes=encoded.encoded) + bitstring.Bits("0b0")
     path = tmp_path / "stream.bin"
     path.write_bytes(bits.tobytes())
 
-    discovered = list(find_frames_from_file(path=path, denominator=2))
+    discovered = list(find_frames_from_file(path=path, denominator=2, codeword_size_bits=1784))
     successful = _successes(discovered)
 
     assert any(
@@ -291,17 +305,27 @@ def test_find_frames_invalid_denominator_raises() -> None:
 def test_find_frames_respects_pseudorandomization_mode() -> None:
     payload = _payload(223, 155)
     encoded = Turbo2Frame(decoded=payload)
-    encoded.encode(pseudorandomization="modern")
+    encoded.encode(pseudorandomization="modern", codeword_size_bits=1784)
     assert encoded.encoded is not None
 
     data = bitstring.Bits("0b101") + bitstring.Bits(bytes=encoded.encoded)
     wrong_mode = list(
-        find_frames_from_bits(data=data, denominator=2, pseudorandomization="legacy")
+        find_frames_from_bits(
+            data=data,
+            denominator=2,
+            pseudorandomization="legacy",
+            codeword_size_bits=1784,
+        )
     )
     assert not _successes(wrong_mode)
 
     correct_mode = list(
-        find_frames_from_bits(data=data, denominator=2, pseudorandomization="modern")
+        find_frames_from_bits(
+            data=data,
+            denominator=2,
+            pseudorandomization="modern",
+            codeword_size_bits=1784,
+        )
     )
     assert any(
         frame.start_bit_index == 3 and frame.parsed is not None and frame.parsed.decoded == payload
