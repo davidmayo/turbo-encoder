@@ -3,11 +3,11 @@ from turbo.scripts.find_consecutive_frames import do_report
 
 from pathlib import Path
 
-root = Path("/home/mayo/Downloads/LMA3_Sim_Files_20250611")
+root = Path("/home/mayo/Downloads/LMA3_Sim_Files_20250611/summary/fixed")
 
 paths = sorted(root.rglob("*.bin"))
 paths.sort(key=lambda path: os.stat(path).st_size)
-output_folder = Path("/home/mayo/Downloads/LMA3_Sim_Files_20250611/summary/")
+output_folder = Path("/home/mayo/Downloads/LMA3_Sim_Files_20250611/summary/fixed/output")
 output_folder.mkdir(parents=True, exist_ok=True)
 
 for index, path in enumerate(paths, start=1):
