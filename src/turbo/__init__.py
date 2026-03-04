@@ -1,5 +1,10 @@
 import dataclasses
-from typing import ClassVar, Literal
+from pathlib import Path
+from typing import ClassVar, Generator, Literal, TypeAlias
+import bitstring
+
+PseudorandomizationMode: TypeAlias = Literal["none", "legacy", "modern"]
+CodewordSizeBits: TypeAlias = Literal[1784, 3568, 7136, 8920]
 
 
 class TurboError(RuntimeError):
@@ -14,6 +19,261 @@ class TurboDecodeError(TurboError):
     """An error with a Turbo decoding process"""
 
 
+_VALID_INFORMATION_BITS = (1784, 3568, 7136, 8920)
+_VALID_INFORMATION_BYTES = tuple(value // 8 for value in _VALID_INFORMATION_BITS)
+_K2_BY_INFORMATION_BITS = {
+    1784: 223,
+    3568: 446,
+    7136: 892,
+    8920: 1115,
+}
+_TERMINATION_BITS = 4
+_INTERLEAVER_PRIMES = (31, 37, 43, 47, 53, 59, 61, 67)
+
+_G1 = (1, 1, 0, 1, 1)
+_G2 = (1, 0, 1, 0, 1)
+_G3 = (1, 1, 1, 1, 1)
+
+_INTERLEAVER_CACHE: dict[int, tuple[int, ...]] = {}
+_PSEUDO_RANDOMIZER_CACHE: dict[
+    tuple[PseudorandomizationMode, int], tuple[int, ...]
+] = {}
+_BYTE_TO_BITS = tuple(
+    tuple((byte >> shift) & 1 for shift in range(7, -1, -1)) for byte in range(256)
+)
+
+
+def _bytes_to_bits(data: bytes) -> list[int]:
+    bits: list[int] = []
+    for byte in data:
+        bits.extend((byte >> shift) & 1 for shift in range(7, -1, -1))
+    return bits
+
+
+def _bits_to_bytes(bits: list[int]) -> bytes:
+    if not bits:
+        return b""
+
+    out = bytearray((len(bits) + 7) // 8)
+    for idx, bit in enumerate(bits):
+        out[idx // 8] |= bit << (7 - (idx % 8))
+    return bytes(out)
+
+
+def _truncate_bits_with_padding_check(data: bytes, bit_length: int) -> list[int]:
+    bits = _bytes_to_bits(data)
+    if len(bits) < bit_length:
+        raise TurboDecodeError(
+            f"Not enough bits in codeword: expected {bit_length}, got {len(bits)}"
+        )
+    if any(bits[bit_length:]):
+        raise TurboDecodeError("Non-zero padding bits found after codeword")
+    return bits[:bit_length]
+
+
+def _packed_codeword_bytes(information_bits: int, denominator: int) -> int:
+    return ((information_bits + _TERMINATION_BITS) * denominator + 7) // 8
+
+
+def _validate_codeword_size_bits(codeword_size_bits: int) -> int:
+    if codeword_size_bits not in _VALID_INFORMATION_BITS:
+        raise ValueError(
+            f"Unsupported codeword size bits: {codeword_size_bits}. "
+            f"Expected one of {_VALID_INFORMATION_BITS}."
+        )
+    return codeword_size_bits
+
+
+def _pseudo_randomizer_bits(
+    pseudorandomization: PseudorandomizationMode, length: int
+) -> tuple[int, ...]:
+    if pseudorandomization == "none":
+        return (0,) * length
+
+    cached = _PSEUDO_RANDOMIZER_CACHE.get((pseudorandomization, length))
+    if cached is not None:
+        return cached
+
+    if pseudorandomization == "legacy":
+        state = [1] * 8
+        sequence = [0] * length
+        for idx in range(length):
+            sequence[idx] = state[-1]  # x0
+            feedback = state[0] ^ state[2] ^ state[4] ^ state[-1]  # x7 ^ x5 ^ x3 ^ x0
+            state = [feedback] + state[:-1]
+    elif pseudorandomization == "modern":
+        state = [int(bit) for bit in "11000111000111000"]
+        sequence = [0] * length
+        for idx in range(length):
+            sequence[idx] = state[-1]  # x0
+            feedback = state[2] ^ state[-1]  # x14 ^ x0
+            state = [feedback] + state[:-1]
+    else:
+        raise ValueError(
+            f"Unsupported pseudorandomization mode: {pseudorandomization}. "
+            "Expected one of 'none', 'legacy', 'modern'."
+        )
+
+    result = tuple(sequence)
+    _PSEUDO_RANDOMIZER_CACHE[(pseudorandomization, length)] = result
+    return result
+
+
+def _apply_pseudorandomization(
+    codeword_bits: list[int], *, pseudorandomization: PseudorandomizationMode
+) -> list[int]:
+    if pseudorandomization == "none":
+        return list(codeword_bits)
+    prn = _pseudo_randomizer_bits(pseudorandomization, len(codeword_bits))
+    return [bit ^ prn_bit for bit, prn_bit in zip(codeword_bits, prn)]
+
+
+def _read_bit_slice_from_file(
+    *,
+    handle,
+    start_bit_index: int,
+    bit_length: int,
+) -> bitstring.Bits:
+    start_byte_index = start_bit_index // 8
+    start_bit_offset = start_bit_index % 8
+    bytes_to_read = (start_bit_offset + bit_length + 7) // 8
+    handle.seek(start_byte_index)
+    raw = handle.read(bytes_to_read)
+    if len(raw) != bytes_to_read:
+        raise EOFError("Requested bit slice extends beyond the available file data")
+    return bitstring.Bits(bytes=raw, offset=start_bit_offset, length=bit_length)
+
+
+def _interleaver_indices(information_bits: int) -> tuple[int, ...]:
+    cached = _INTERLEAVER_CACHE.get(information_bits)
+    if cached is not None:
+        return cached
+
+    if information_bits not in _K2_BY_INFORMATION_BITS:
+        raise TurboEncodeError(
+            f"Unsupported information block length: {information_bits} bits"
+        )
+
+    k1 = 8
+    k2 = _K2_BY_INFORMATION_BITS[information_bits]
+    half_k1 = k1 // 2
+
+    indices = [0] * information_bits
+    for s in range(1, information_bits + 1):
+        m = (s - 1) % 2
+        i = (s - 1) // (2 * k2)
+        j = ((s - 1) // 2) - (i * k2)
+
+        t = (19 * i + 1) % half_k1
+        q = (t % 8) + 1
+        c = (_INTERLEAVER_PRIMES[q - 1] * j + 21 * m) % k2
+        pi = 2 * (t + c * half_k1 + 1) - m
+
+        indices[s - 1] = pi - 1
+
+    if len(set(indices)) != information_bits:
+        raise TurboEncodeError(
+            "Interleaver permutation generation failed to produce a valid permutation"
+        )
+
+    result = tuple(indices)
+    _INTERLEAVER_CACHE[information_bits] = result
+    return result
+
+
+def _component_encode(
+    information_bits: list[int],
+    forward_vectors: dict[str, tuple[int, int, int, int, int]],
+) -> tuple[list[int], dict[str, list[int]]]:
+    m1 = m2 = m3 = m4 = 0
+    systematic: list[int] = []
+    parity = {name: [] for name in forward_vectors}
+
+    for idx in range(len(information_bits) + _TERMINATION_BITS):
+        feedback = m3 ^ m4  # G0=10011
+        switch_value = (
+            information_bits[idx] if idx < len(information_bits) else feedback
+        )
+        recursive_input = switch_value ^ feedback
+
+        systematic.append(switch_value)
+        taps = (recursive_input, m1, m2, m3, m4)
+
+        for name, vector in forward_vectors.items():
+            value = 0
+            for include, tap in zip(vector, taps):
+                if include:
+                    value ^= tap
+            parity[name].append(value)
+
+        m1, m2, m3, m4 = recursive_input, m1, m2, m3
+
+    return systematic, parity
+
+
+def _build_codeword_bits(information_bits: list[int], denominator: int) -> list[int]:
+    information_bit_count = len(information_bits)
+    if information_bit_count not in _VALID_INFORMATION_BITS:
+        raise TurboEncodeError(
+            f"Unsupported information block length: {information_bit_count} bits"
+        )
+
+    permutation = _interleaver_indices(information_bit_count)
+    interleaved = [information_bits[index] for index in permutation]
+
+    if denominator in (2, 3):
+        out0a, parity_a = _component_encode(information_bits, {"1": _G1})
+        _, parity_b = _component_encode(interleaved, {"1": _G1})
+    elif denominator == 4:
+        out0a, parity_a = _component_encode(information_bits, {"2": _G2, "3": _G3})
+        _, parity_b = _component_encode(interleaved, {"1": _G1})
+    elif denominator == 6:
+        out0a, parity_a = _component_encode(
+            information_bits, {"1": _G1, "2": _G2, "3": _G3}
+        )
+        _, parity_b = _component_encode(interleaved, {"1": _G1, "3": _G3})
+    else:
+        raise TurboEncodeError(
+            f"Unsupported Turbo denominator: {denominator}. Expected one of 2, 3, 4, 6."
+        )
+
+    symbol_count = information_bit_count + _TERMINATION_BITS
+    codeword: list[int] = []
+
+    if denominator == 2:
+        for idx in range(symbol_count):
+            codeword.append(out0a[idx])
+            codeword.append(parity_a["1"][idx] if idx % 2 == 0 else parity_b["1"][idx])
+    elif denominator == 3:
+        for idx in range(symbol_count):
+            codeword.extend((out0a[idx], parity_a["1"][idx], parity_b["1"][idx]))
+    elif denominator == 4:
+        for idx in range(symbol_count):
+            codeword.extend(
+                (out0a[idx], parity_a["2"][idx], parity_a["3"][idx], parity_b["1"][idx])
+            )
+    else:  # denominator == 6
+        for idx in range(symbol_count):
+            codeword.extend(
+                (
+                    out0a[idx],
+                    parity_a["1"][idx],
+                    parity_a["2"][idx],
+                    parity_a["3"][idx],
+                    parity_b["1"][idx],
+                    parity_b["3"][idx],
+                )
+            )
+
+    expected_length = (information_bit_count + _TERMINATION_BITS) * denominator
+    if len(codeword) != expected_length:
+        raise TurboEncodeError(
+            f"Invalid codeword length generated: expected {expected_length}, got {len(codeword)}"
+        )
+
+    return codeword
+
+
 @dataclasses.dataclass
 class TurboFrame:
     DENOMINATOR: ClassVar[Literal[2, 3, 4, 6]]
@@ -21,25 +281,112 @@ class TurboFrame:
     encoded: bytes | None = None
     decoded: bytes | None = None
 
-    def encode(self) -> None:
+    def encode(
+        self,
+        *,
+        pseudorandomization: PseudorandomizationMode = "legacy",
+        codeword_size_bits: CodewordSizeBits = 8920,
+    ) -> None:
         """Encode the `decoded` value according to the specific turbo encoding algorithm
 
         Resulting value will be stored in `encoded`.
 
         Encoding errors will raise a `TurboEncodeException`"""
-        raise NotImplementedError(
-            f"{self.__class__.__name__} must implement the 'encode()' method"
-        )
+        if self.decoded is None:
+            raise TurboEncodeError("Cannot encode: 'decoded' is not set")
 
-    def decode(self) -> None:
+        information_bits_count = _validate_codeword_size_bits(codeword_size_bits)
+        expected_payload_bytes = information_bits_count // 8
+        payload_length = len(self.decoded)
+        if payload_length != expected_payload_bytes:
+            raise TurboEncodeError(
+                "Payload length does not match selected codeword size. "
+                f"Got {payload_length} bytes; expected {expected_payload_bytes} bytes "
+                f"for codeword_size_bits={information_bits_count}."
+            )
+
+        information_bits = _bytes_to_bits(self.decoded)
+        codeword_bits = _build_codeword_bits(information_bits, self.DENOMINATOR)
+        codeword_bits = _apply_pseudorandomization(
+            codeword_bits, pseudorandomization=pseudorandomization
+        )
+        self.encoded = self.ASM + _bits_to_bytes(codeword_bits)
+
+    def decode(
+        self,
+        *,
+        pseudorandomization: PseudorandomizationMode = "legacy",
+        codeword_size_bits: CodewordSizeBits = 8920,
+    ) -> None:
         """Decode the `encoded` value according to the specific turbo decoding algorithm.
 
         Resulting value will be stored in `decoded`.
 
         Decoding errors will raise a `TurboDecodeException`"""
-        raise NotImplementedError(
-            f"{self.__class__.__name__} must implement the 'decode()' method"
+        if self.encoded is None:
+            raise TurboDecodeError("Cannot decode: 'encoded' is not set")
+
+        information_bits_count = _validate_codeword_size_bits(codeword_size_bits)
+        expected_codeword_bytes = _packed_codeword_bytes(
+            information_bits_count, self.DENOMINATOR
         )
+
+        codeword_bytes: bytes | None = None
+
+        if self.encoded.startswith(self.ASM):
+            candidate = self.encoded[len(self.ASM) :]
+            if len(candidate) == expected_codeword_bytes:
+                codeword_bytes = candidate
+
+        if codeword_bytes is None:
+            if len(self.encoded) == expected_codeword_bytes:
+                codeword_bytes = self.encoded
+
+        if codeword_bytes is None:
+            raw_length = expected_codeword_bytes
+            asm_length = expected_codeword_bytes + len(self.ASM)
+            raise TurboDecodeError(
+                "Invalid encoded length for Turbo decoding. "
+                f"Got {len(self.encoded)} bytes; expected raw codeword length {raw_length} "
+                f"or ASM-prefixed length {asm_length} for codeword_size_bits={information_bits_count}."
+            )
+
+        total_codeword_bits = (
+            information_bits_count + _TERMINATION_BITS
+        ) * self.DENOMINATOR
+        codeword_bits = _truncate_bits_with_padding_check(
+            codeword_bytes, total_codeword_bits
+        )
+        expected_systematic_length = information_bits_count + _TERMINATION_BITS
+
+        def _decode_candidate(candidate_bits: list[int]) -> bytes | None:
+            if self.DENOMINATOR == 2:
+                systematic = candidate_bits[::2]
+            else:
+                systematic = candidate_bits[:: self.DENOMINATOR]
+
+            if len(systematic) != expected_systematic_length:
+                return None
+
+            candidate_information_bits = systematic[:information_bits_count]
+            expected_codeword_bits = _build_codeword_bits(
+                candidate_information_bits, self.DENOMINATOR
+            )
+            if expected_codeword_bits != candidate_bits:
+                return None
+            return _bits_to_bytes(candidate_information_bits)
+
+        candidate_bits = _apply_pseudorandomization(
+            codeword_bits, pseudorandomization=pseudorandomization
+        )
+        decoded = _decode_candidate(candidate_bits)
+
+        if decoded is None:
+            raise TurboDecodeError(
+                "Codeword parity/termination validation failed; frame cannot be decoded"
+            )
+
+        self.decoded = decoded
 
 
 @dataclasses.dataclass
@@ -66,5 +413,210 @@ class Turbo6Frame(TurboFrame):
     ASM = bytes.fromhex("25D5C0CE8990F6C9461BF79C DA2A3F31766F0936B9E40863")
 
 
+_FRAME_TYPE_BY_DENOMINATOR: dict[
+    int, type[Turbo2Frame | Turbo3Frame | Turbo4Frame | Turbo6Frame]
+] = {
+    2: Turbo2Frame,
+    3: Turbo3Frame,
+    4: Turbo4Frame,
+    6: Turbo6Frame,
+}
+
+
+@dataclasses.dataclass
+class DiscoveredTurboFrame:
+    """A turbo frame discovered in a bit stream"""
+
+    DENOMINATOR: Literal[2, 3, 4, 6]
+    path: Path | None = None
+    """The file that contains the raw data, if there is one."""
+    start_bit_index: int | None = None
+    """The bit index of the start of the frame (i.e., the start of the ASM) within the file, if there is one"""
+    decode_success: bool | None = None
+    """Does this frame decode properly?"""
+    parsed: TurboFrame | None = None
+    """The decoded data in a TurboFrame instance, if decodable"""
+
+
+def _get_frame_type_for_denominator(
+    denominator: int,
+) -> type[Turbo2Frame | Turbo3Frame | Turbo4Frame | Turbo6Frame]:
+    frame_type = _FRAME_TYPE_BY_DENOMINATOR.get(denominator)
+    if frame_type is None:
+        raise ValueError(
+            f"Unsupported denominator: {denominator}. Expected one of 2, 3, 4, 6."
+        )
+    return frame_type
+
+
+def find_frames_from_bits(
+    *,
+    data: bitstring.Bits,
+    denominator: Literal[2, 3, 4, 6],
+    pseudorandomization: PseudorandomizationMode = "legacy",
+    codeword_size_bits: CodewordSizeBits = 8920,
+) -> Generator[DiscoveredTurboFrame, None, None]:
+    frame_type = _get_frame_type_for_denominator(int(denominator))
+    asm_bits = bitstring.Bits(bytes=frame_type.ASM)
+    information_bits_count = _validate_codeword_size_bits(codeword_size_bits)
+    frame_bits_length = len(asm_bits) + (
+        information_bits_count + _TERMINATION_BITS
+    ) * int(denominator)
+
+    for asm_start in data.findall(asm_bits, bytealigned=False):
+        frame_end = asm_start + frame_bits_length
+        if frame_end > len(data):
+            continue
+
+        candidate_bits = data[asm_start:frame_end]
+        candidate_frame = frame_type(encoded=candidate_bits.tobytes())
+        try:
+            candidate_frame.decode(
+                pseudorandomization=pseudorandomization,
+                codeword_size_bits=codeword_size_bits,
+            )
+            yield DiscoveredTurboFrame(
+                DENOMINATOR=denominator,
+                path=None,
+                start_bit_index=asm_start,
+                decode_success=True,
+                parsed=candidate_frame,
+            )
+        except TurboDecodeError:
+            yield DiscoveredTurboFrame(
+                DENOMINATOR=denominator,
+                path=None,
+                start_bit_index=asm_start,
+                decode_success=False,
+                parsed=None,
+            )
+
+
+def find_frames_from_bytes(
+    *,
+    data: bytes | bytearray | memoryview | bitstring.Bits,
+    denominator: Literal[2, 3, 4, 6],
+    pseudorandomization: PseudorandomizationMode = "legacy",
+    codeword_size_bits: CodewordSizeBits = 8920,
+) -> Generator[DiscoveredTurboFrame, None, None]:
+    bits = (
+        data if isinstance(data, bitstring.Bits) else bitstring.Bits(bytes=bytes(data))
+    )
+    yield from find_frames_from_bits(
+        data=bits,
+        denominator=denominator,
+        pseudorandomization=pseudorandomization,
+        codeword_size_bits=codeword_size_bits,
+    )
+
+
+def find_frames_from_file(
+    *,
+    path: str | bytes | Path,
+    denominator: Literal[2, 3, 4, 6],
+    pseudorandomization: PseudorandomizationMode = "legacy",
+    codeword_size_bits: CodewordSizeBits = 8920,
+) -> Generator[DiscoveredTurboFrame, None, None]:
+    resolved_path = Path(path).resolve()
+    frame_type = _get_frame_type_for_denominator(int(denominator))
+    information_bits_count = _validate_codeword_size_bits(codeword_size_bits)
+    asm_bits = bitstring.Bits(bytes=frame_type.ASM)
+    asm_length = len(asm_bits)
+    asm_mask = (1 << asm_length) - 1
+    asm_value = asm_bits.uint
+
+    frame_bits_length = asm_length + (information_bits_count + _TERMINATION_BITS) * int(
+        denominator
+    )
+    total_bits = resolved_path.stat().st_size * 8
+
+    bits_seen = 0
+    rolling = 0
+    chunk_size = 1024 * 1024
+
+    with (
+        resolved_path.open("rb") as scan_handle,
+        resolved_path.open("rb") as read_handle,
+    ):
+        while True:
+            chunk = scan_handle.read(chunk_size)
+            if not chunk:
+                break
+
+            for byte in chunk:
+                for bit in _BYTE_TO_BITS[byte]:
+                    rolling = ((rolling << 1) | bit) & asm_mask
+                    if bits_seen >= asm_length - 1 and rolling == asm_value:
+                        start_bit_index = bits_seen - asm_length + 1
+                        if start_bit_index + frame_bits_length > total_bits:
+                            bits_seen += 1
+                            continue
+
+                        candidate_bits = _read_bit_slice_from_file(
+                            handle=read_handle,
+                            start_bit_index=start_bit_index,
+                            bit_length=frame_bits_length,
+                        )
+                        candidate_frame = frame_type(encoded=candidate_bits.tobytes())
+                        try:
+                            candidate_frame.decode(
+                                pseudorandomization=pseudorandomization,
+                                codeword_size_bits=codeword_size_bits,
+                            )
+                            yield DiscoveredTurboFrame(
+                                DENOMINATOR=denominator,
+                                path=resolved_path,
+                                start_bit_index=start_bit_index,
+                                decode_success=True,
+                                parsed=candidate_frame,
+                            )
+                        except TurboDecodeError:
+                            yield DiscoveredTurboFrame(
+                                DENOMINATOR=denominator,
+                                path=resolved_path,
+                                start_bit_index=start_bit_index,
+                                decode_success=False,
+                                parsed=None,
+                            )
+
+                    bits_seen += 1
+
+
 if __name__ == "__main__":
-    pass
+    from pathlib import Path
+    from collections import Counter
+
+    indexes: list[tuple[bool, int]] = []
+    counter = Counter()
+    path = Path(
+        # "/home/mayo/Downloads/LMA3_Sim_Files_20250611/1kbps_t6_SimFile/LMA3001kt6250611.bin"
+        "/home/mayo/Downloads/LMA3_Sim_Files_20250611/16kbps_t6_SimFile/LMA3016kt6250211.bin"
+    )
+
+    import time
+
+    start = time.monotonic()
+    count = 0
+    for index, found_frame in enumerate(
+        find_frames_from_file(
+            path=path,
+            denominator=6,
+            codeword_size_bits=8920,
+        )
+    ):
+        if index % 100 == 0:
+            print(
+                f"#{index + 1} index: {found_frame.start_bit_index:,} GOOD: {found_frame.decode_success}"
+            )
+        count += 1
+        counter[found_frame.decode_success] += 1
+        indexes.append((found_frame.decode_success, found_frame.start_bit_index))
+    end = time.monotonic()
+    print(f"Found {count} in {(end - start)} s")
+
+    # for found_frame in found_frames:
+    #     counter[found_frame.decode_success] += 1
+    print(counter)
+    # indexes = [f.start_bit_index for f in found_frames]
+    print(f"{indexes[:25]}")
+    print(f"{indexes[-25:]}")
